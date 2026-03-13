@@ -938,20 +938,152 @@ def generate_svg_icon(app_name, color='#5b6ef5'):
 '''
 
 # ══════════════════════════════════════════════════════════════════════
-#  META-INF (APK signing stub)
+#  REAL APK SIGNING  (v1 JAR + v2 APK Signature Scheme)
 # ══════════════════════════════════════════════════════════════════════
 
-def make_manifest_mf(entries):
-    lines = ['Manifest-Version: 1.0', 'Created-By: AppForge 1.0', '']
-    for name, sha in entries:
-        lines += [f'Name: {name}', f'SHA-256-Digest: {sha}', '']
-    return '\n'.join(lines).encode('utf-8')
+def _gen_signing_key():
+    """Generate ephemeral RSA-2048 key + self-signed cert."""
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives import hashes
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    import datetime
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, u'AppForge')])
+    now  = datetime.datetime.now(datetime.timezone.utc)
+    cert = (x509.CertificateBuilder()
+        .subject_name(name).issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + datetime.timedelta(days=9999))
+        .sign(key, hashes.SHA256()))
+    return key, cert
 
-def make_cert_sf(manifest_sha):
-    return f'''Signature-Version: 1.0
-Created-By: AppForge 1.0
-SHA-256-Digest-Manifest: {manifest_sha}
-'''.encode('utf-8')
+
+def _v1_sign(entries, private_key, cert):
+    """
+    JAR/APK v1 signing.
+    Returns (MANIFEST.MF, CERT.SF, CERT.RSA) as bytes.
+    """
+    from cryptography.hazmat.primitives.serialization import pkcs7, Encoding
+    from cryptography.hazmat.primitives import hashes
+
+    def b64sha(data):
+        return base64.b64encode(hashlib.sha256(data).digest()).decode()
+
+    # MANIFEST.MF — CRLF line endings required by JAR spec
+    mf = b'Manifest-Version: 1.0\r\nCreated-By: AppForge\r\n\r\n'
+    sections = []
+    for name, data in entries:
+        sec = f'Name: {name}\r\nSHA-256-Digest: {b64sha(data)}\r\n\r\n'.encode()
+        mf += sec
+        sections.append(sec)
+
+    # CERT.SF
+    sf = (f'Signature-Version: 1.0\r\nCreated-By: AppForge\r\n'
+          f'SHA-256-Digest-Manifest: {b64sha(mf)}\r\n\r\n').encode()
+    for sec in sections:
+        sf += f'SHA-256-Digest: {b64sha(sec)}\r\n\r\n'.encode()  # section digests
+
+    # CERT.RSA — PKCS#7 detached SignedData
+    cert_rsa = (pkcs7.PKCS7SignatureBuilder()
+        .set_data(sf)
+        .add_signer(cert, private_key, hashes.SHA256())
+        .sign(Encoding.DER, [pkcs7.PKCS7Options.DetachedSignature]))
+
+    return mf, sf, cert_rsa
+
+
+def _v2_sign(apk_bytes, private_key, cert):
+    """
+    APK Signature Scheme v2.
+    Inserts a signing block before the ZIP Central Directory.
+    Required for Android 7+ (API 24+).
+    """
+    from cryptography.hazmat.primitives.asymmetric import padding
+    from cryptography.hazmat.primitives import hashes, serialization
+
+    # ── locate Central Directory and EOCD ─────────────────────────
+    eocd_magic = b'PK\x05\x06'
+    eocd_off   = apk_bytes.rfind(eocd_magic)
+    if eocd_off == -1:
+        return apk_bytes  # not a valid ZIP, bail
+
+    cd_offset = struct.unpack_from('<I', apk_bytes, eocd_off + 16)[0]
+
+    data_block  = apk_bytes[:cd_offset]
+    central_dir = apk_bytes[cd_offset:eocd_off]
+    eocd        = bytearray(apk_bytes[eocd_off:])
+    # Zero out the CD offset in EOCD for signing
+    struct.pack_into('<I', eocd, 16, 0)
+
+    # ── compute content digests (spec §4.3) ───────────────────────
+    CHUNK = 1 << 20  # 1 MB chunks
+
+    def chunked_digests(blob):
+        out = []
+        for i in range(0, max(len(blob), 1), CHUNK):
+            c = blob[i:i+CHUNK]
+            out.append(hashlib.sha256(b'\xa5' + struct.pack('<I', len(c)) + c).digest())
+        return out
+
+    all_chunks = (chunked_digests(data_block) +
+                  chunked_digests(central_dir) +
+                  chunked_digests(bytes(eocd)))
+
+    top_digest = hashlib.sha256(
+        b'\x5a' + struct.pack('<I', len(all_chunks)) + b''.join(all_chunks)
+    ).digest()
+
+    # ── helpers ────────────────────────────────────────────────────
+    def lp32(data):   # uint32-length-prefixed
+        return struct.pack('<I', len(data)) + data
+
+    ALG = 0x0103  # RSA PKCS#1 v1.5 with SHA-256
+
+    # ── signed_data block ─────────────────────────────────────────
+    digest_entry = struct.pack('<I', ALG) + lp32(top_digest)
+    digests_seq  = lp32(lp32(digest_entry))
+
+    cert_der    = cert.public_bytes(serialization.Encoding.DER)
+    certs_seq   = lp32(lp32(cert_der))
+    attrs_seq   = lp32(b'')  # no additional attributes
+
+    signed_data = lp32(digests_seq + certs_seq + attrs_seq)
+
+    # ── signature over signed_data ────────────────────────────────
+    raw_sig  = private_key.sign(signed_data, padding.PKCS1v15(), hashes.SHA256())
+    sig_entry = struct.pack('<I', ALG) + lp32(raw_sig)
+    sigs_seq  = lp32(lp32(sig_entry))
+
+    pub_der = private_key.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+
+    # ── signer = signed_data + signatures + public_key ────────────
+    signer        = lp32(signed_data + sigs_seq + lp32(pub_der))
+    v2_block_val  = lp32(signer)   # sequence of signers (just one)
+
+    # ── APK Signing Block ─────────────────────────────────────────
+    # pair: uint64(len(id+value)) + uint32(id) + value
+    pair       = struct.pack('<QI', len(v2_block_val) + 4, 0x7109871a) + v2_block_val
+    block_size = len(pair) + 8 + 16   # pairs + second size field + magic
+    signing_block = (
+        struct.pack('<Q', block_size) +
+        pair +
+        struct.pack('<Q', block_size) +
+        b'APK Sig Block 42'
+    )
+
+    # ── reassemble APK with updated CD offset ─────────────────────
+    new_cd_offset = cd_offset + len(signing_block)
+    new_eocd = bytearray(apk_bytes[eocd_off:])
+    struct.pack_into('<I', new_eocd, 16, new_cd_offset)
+
+    return data_block + signing_block + central_dir + bytes(new_eocd)
+
 
 def sha256_b64(data):
     return base64.b64encode(hashlib.sha256(data).digest()).decode()
@@ -1293,19 +1425,24 @@ def build_apk(config, out_dir):
         'version': version_n, 'built_by': 'AppForge'
     }, indent=2).encode()))
 
-    # Build META-INF
-    mf_entries = [(name, sha256_b64(data)) for name, data in entries]
-    manifest_mf = make_manifest_mf(mf_entries)
-    cert_sf = make_cert_sf(sha256_b64(manifest_mf))
+    # Build real META-INF v1 signing
+    private_key, cert = _gen_signing_key()
+    manifest_mf, cert_sf, cert_rsa = _v1_sign(entries, private_key, cert)
 
     entries.append(('META-INF/MANIFEST.MF', manifest_mf))
-    entries.append(('META-INF/CERT.SF', cert_sf))
-    entries.append(('META-INF/CERT.RSA', b'APPFORGE_SIGNATURE_PLACEHOLDER'))
+    entries.append(('META-INF/CERT.SF',     cert_sf))
+    entries.append(('META-INF/CERT.RSA',    cert_rsa))
 
-    # Write APK (ZIP format)
+    # Write APK (ZIP format, MANIFEST.MF must be STORED not deflated)
     with zipfile.ZipFile(apk_path, 'w', zipfile.ZIP_DEFLATED) as zf:
         for name, data in entries:
-            zf.writestr(name, data)
+            compress = zipfile.ZIP_STORED if name == 'META-INF/MANIFEST.MF' else zipfile.ZIP_DEFLATED
+            zf.writestr(zipfile.ZipInfo(name), data, compress_type=compress)
+
+    # Apply APK Signature Scheme v2 (required for Android 7+)
+    apk_bytes = apk_path.read_bytes()
+    signed_bytes = _v2_sign(apk_bytes, private_key, cert)
+    apk_path.write_bytes(signed_bytes)
 
     print(f"     ✓ APK written: {apk_path.name} ({apk_path.stat().st_size // 1024} KB)")
 
