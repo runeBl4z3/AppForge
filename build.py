@@ -982,11 +982,11 @@ def _v1_sign(entries, private_key, cert):
         mf += sec
         sections.append(sec)
 
-    # CERT.SF
+    # CERT.SF — each entry section must have Name: field (JAR spec)
     sf = (f'Signature-Version: 1.0\r\nCreated-By: AppForge\r\n'
           f'SHA-256-Digest-Manifest: {b64sha(mf)}\r\n\r\n').encode()
-    for sec in sections:
-        sf += f'SHA-256-Digest: {b64sha(sec)}\r\n\r\n'.encode()  # section digests
+    for (entry_name, _), sec in zip(entries, sections):
+        sf += f'Name: {entry_name}\r\nSHA-256-Digest: {b64sha(sec)}\r\n\r\n'.encode()
 
     # CERT.RSA — PKCS#7 detached SignedData
     cert_rsa = (pkcs7.PKCS7SignatureBuilder()
@@ -1055,7 +1055,8 @@ def _v2_sign(apk_bytes, private_key, cert):
     signers = lp32(signer)
 
     BLOCK_ID = 0x7109871a
-    pair = struct.pack('<QI', len(signers), BLOCK_ID) + signers
+    # Per AOSP source: pair uint64 length = len(value) + 4 (for the uint32 ID)
+    pair = struct.pack('<QI', len(signers) + 4, BLOCK_ID) + signers
     block_size = len(pair) + 8 + 16
     signing_block = (
         struct.pack('<Q', block_size) + pair +
