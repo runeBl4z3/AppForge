@@ -57,19 +57,23 @@ class AXMLEncoder:
         offsets, off = [], 0
         for r in raw:
             offsets.append(off); off += len(r)
-        sdata = b''.join(raw)
-        odata = struct.pack('<' + 'I'*len(offsets), *offsets) if offsets else b''
+        sdata  = b''.join(raw)
+        odata  = struct.pack('<' + 'I'*len(offsets), *offsets) if offsets else b''
+        # Header = 8 (ResChunk_header) + 20 (5 × uint32 fields) = 28 bytes exactly
+        # stringsStart is offset from chunk start to first string byte
         strings_start = 28 + len(odata)
-        chunk_body = struct.pack('<IIIIII', len(self.strings), 0, 0, strings_start, 0, 0) + odata + sdata
+        # 5 fields: stringCount, styleCount, flags, stringsStart, stylesStart
+        fields = struct.pack('<IIIII', len(self.strings), 0, 0, strings_start, 0)
+        chunk_body = fields + odata + sdata
         pad = (4 - len(chunk_body) % 4) % 4
         chunk_body += b'\x00' * pad
         return struct.pack('<II', self.CHUNK_STRPOOL, 8 + len(chunk_body)) + chunk_body
 
     def _start_ns(self, prefix, uri):
-        return struct.pack('<IIIIII', self.CHUNK_STARTNS, 24, 0, 1, self.s(prefix), self.s(uri))
+        return struct.pack('<IIIIII', self.CHUNK_STARTNS, 24, 1, 0xFFFFFFFF, self.s(prefix), self.s(uri))
 
     def _end_ns(self, prefix, uri):
-        return struct.pack('<IIIIII', self.CHUNK_ENDNS, 24, 0, 1, self.s(prefix), self.s(uri))
+        return struct.pack('<IIIIII', self.CHUNK_ENDNS, 24, 1, 0xFFFFFFFF, self.s(prefix), self.s(uri))
 
     def _start_tag(self, ns_idx, name, attrs, line=1):
         # attrs: list of (ns, name, raw_str, type_val, data_val)
@@ -139,18 +143,15 @@ class AXMLEncoder:
 
         # <application ...>
         body += self._start_tag(NULL, self.s('application'), [
-            (ns, self.s('label'),              self.s(label), STR,  self.s(label)),
-            (ns, self.s('allowBackup'),        self.s('true'), BOOL, 0xFFFFFFFF),
-            (ns, self.s('hardwareAccelerated'),self.s('true'), BOOL, 0xFFFFFFFF),
+            (ns, self.s('label'),              self.s(label),  STR,  self.s(label)),
+            (ns, self.s('allowBackup'),        0xFFFFFFFF,     BOOL, 0xFFFFFFFF),
+            (ns, self.s('hardwareAccelerated'),0xFFFFFFFF,     BOOL, 0xFFFFFFFF),
         ])
 
         # <activity ...>
         body += self._start_tag(NULL, self.s('activity'), [
-            (ns, self.s('name'),            self.s('.MainActivity'),  STR, self.s('.MainActivity')),
-            (ns, self.s('exported'),        self.s('true'),           BOOL, 0xFFFFFFFF),
-            (ns, self.s('screenOrientation'),self.s('portrait'),      STR, self.s('portrait')),
-            (ns, self.s('configChanges'),   self.s('keyboard|keyboardHidden|orientation|screenSize'),
-             STR, self.s('keyboard|keyboardHidden|orientation|screenSize')),
+            (ns, self.s('name'),     self.s('.MainActivity'), STR,  self.s('.MainActivity')),
+            (ns, self.s('exported'), 0xFFFFFFFF,              BOOL, 0xFFFFFFFF),
         ])
         body += self._start_tag(NULL, self.s('intent-filter'), [])
         body += self._start_tag(NULL, self.s('action'), [
@@ -1277,18 +1278,21 @@ def make_webview_dex(package_name, url):
     # Map list
     map_off = align4(class_data_end)
     n_tl = len(tl_parts_list)
+    # DEX spec type codes (https://source.android.com/docs/core/runtime/dex-format)
+    # 0x1000=MAP_LIST  0x1001=TYPE_LIST
+    # 0x2000=CLASS_DATA_ITEM  0x2001=CODE_ITEM  0x2002=STRING_DATA_ITEM
     map_items = sorted([
-        (0x0000, 1,        0),
-        (0x0001, N_STR,    str_ids_off),
-        (0x0002, N_TYPE,   type_ids_off),
-        (0x0003, N_PROTO,  proto_ids_off),
-        (0x0005, N_METHOD, meth_ids_off),
-        (0x0006, 1,        class_def_off),
-        (0x2000, N_STR,    data_off),
-    ] + ([(0x2003, n_tl, tl_off)] if n_tl else []) + [
-        (0x1000, 2,        ci_init_off),
-        (0x2005, 1,        class_data_off),
-        (0x1003, 1,        map_off),
+        (0x0000, 1,        0),              # HEADER_ITEM
+        (0x0001, N_STR,    str_ids_off),    # STRING_ID_ITEM
+        (0x0002, N_TYPE,   type_ids_off),   # TYPE_ID_ITEM
+        (0x0003, N_PROTO,  proto_ids_off),  # PROTO_ID_ITEM
+        (0x0005, N_METHOD, meth_ids_off),   # METHOD_ID_ITEM
+        (0x0006, 1,        class_def_off),  # CLASS_DEF_ITEM
+        (0x2002, N_STR,    data_off),       # STRING_DATA_ITEM  ← was 0x2000
+    ] + ([(0x1001, n_tl, tl_off)] if n_tl else []) + [  # TYPE_LIST  ← was 0x2003
+        (0x2001, 2,        ci_init_off),    # CODE_ITEM  ← was 0x1000
+        (0x2000, 1,        class_data_off), # CLASS_DATA_ITEM  ← was 0x2005
+        (0x1000, 1,        map_off),        # MAP_LIST  ← was 0x1003
     ], key=lambda e: e[2])
 
     map_bytes = struct.pack('<I', len(map_items))
