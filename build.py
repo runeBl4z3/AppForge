@@ -76,11 +76,12 @@ class AXMLEncoder:
         attr_data = b''
         for (a_ns, a_name, a_raw, a_type, a_val) in attrs:
             attr_data += struct.pack('<IIIII', a_ns, a_name, a_raw, a_type, a_val)
-        size = 48 + len(attr_data)
-        hdr = struct.pack('<IIIIIIIIIIII',
-            self.CHUNK_STARTTAG, size, line, 0xFFFFFFFF,
-            0xFFFFFFFF, name, 20, 20, len(attrs), 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF)
-        return hdr + attr_data
+        chunk_size = 36 + len(attr_data)
+        # ResXMLTree_node (16 bytes): type(H) headerSize(H) size(I) lineNumber(I) comment(I)
+        node = struct.pack('<HHIII', 0x0102, 16, chunk_size, line, 0xFFFFFFFF)
+        # ResXMLTree_attrExt (20 bytes): ns(I) name(I) attrStart(H) attrSize(H) attrCount(H) idIdx(H) classIdx(H) styleIdx(H)
+        ext  = struct.pack('<IIHHHHHH', ns_idx, name, 20, 20, len(attrs), 0, 0, 0)
+        return node + ext + attr_data
 
     def _end_tag(self, name, line=1):
         return struct.pack('<IIIIII', self.CHUNK_ENDTAG, 24, line, 0xFFFFFFFF, 0xFFFFFFFF, name)
@@ -997,91 +998,72 @@ def _v1_sign(entries, private_key, cert):
 
 def _v2_sign(apk_bytes, private_key, cert):
     """
-    APK Signature Scheme v2.
-    Inserts a signing block before the ZIP Central Directory.
-    Required for Android 7+ (API 24+).
+    APK Signature Scheme v2 — corrected implementation.
+    Per https://source.android.com/docs/security/features/apksigning/v2
     """
-    from cryptography.hazmat.primitives.asymmetric import padding
+    from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
     from cryptography.hazmat.primitives import hashes, serialization
 
-    # ── locate Central Directory and EOCD ─────────────────────────
+    def lp32(d): return struct.pack('<I', len(d)) + d
+
     eocd_magic = b'PK\x05\x06'
     eocd_off   = apk_bytes.rfind(eocd_magic)
     if eocd_off == -1:
-        return apk_bytes  # not a valid ZIP, bail
-
+        return apk_bytes
     cd_offset = struct.unpack_from('<I', apk_bytes, eocd_off + 16)[0]
 
     data_block  = apk_bytes[:cd_offset]
     central_dir = apk_bytes[cd_offset:eocd_off]
-    eocd        = bytearray(apk_bytes[eocd_off:])
-    # Zero out the CD offset in EOCD for signing
-    struct.pack_into('<I', eocd, 16, 0)
+    eocd_orig   = apk_bytes[eocd_off:]
 
-    # ── compute content digests (spec §4.3) ───────────────────────
-    CHUNK = 1 << 20  # 1 MB chunks
+    # Per spec: EOCD CD-offset field → offset of signing block (= cd_offset)
+    eocd_digest = bytearray(eocd_orig)
+    struct.pack_into('<I', eocd_digest, 16, cd_offset)
 
-    def chunked_digests(blob):
-        out = []
-        for i in range(0, max(len(blob), 1), CHUNK):
-            c = blob[i:i+CHUNK]
-            out.append(hashlib.sha256(b'\xa5' + struct.pack('<I', len(c)) + c).digest())
-        return out
+    CHUNK = 1 << 20
+    def section_digests(blob):
+        n = max(1, (len(blob) + CHUNK - 1) // CHUNK)
+        chunks = []
+        for i in range(n):
+            c = blob[i*CHUNK:(i+1)*CHUNK]
+            chunks.append(hashlib.sha256(b'\xa5' + struct.pack('<I', len(c)) + c).digest())
+        return chunks
 
-    all_chunks = (chunked_digests(data_block) +
-                  chunked_digests(central_dir) +
-                  chunked_digests(bytes(eocd)))
-
+    all_chunks = (section_digests(data_block) +
+                  section_digests(central_dir) +
+                  section_digests(bytes(eocd_digest)))
     top_digest = hashlib.sha256(
         b'\x5a' + struct.pack('<I', len(all_chunks)) + b''.join(all_chunks)
     ).digest()
 
-    # ── helpers ────────────────────────────────────────────────────
-    def lp32(data):   # uint32-length-prefixed
-        return struct.pack('<I', len(data)) + data
+    ALG = 0x0103  # RSASSA-PKCS1-v1_5 with SHA-256
+    digest_entry      = lp32(struct.pack('<I', ALG) + lp32(top_digest))
+    digests           = lp32(digest_entry)
+    cert_der          = cert.public_bytes(serialization.Encoding.DER)
+    certificates      = lp32(lp32(cert_der))
+    attributes        = lp32(b'')
+    signed_data_bytes = digests + certificates + attributes  # signed WITHOUT outer length prefix
 
-    ALG = 0x0103  # RSA PKCS#1 v1.5 with SHA-256
+    raw_sig   = private_key.sign(signed_data_bytes, asym_padding.PKCS1v15(), hashes.SHA256())
+    sig_entry = lp32(struct.pack('<I', ALG) + lp32(raw_sig))
+    signatures = lp32(sig_entry)
+    pub_der    = private_key.public_key().public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
 
-    # ── signed_data block ─────────────────────────────────────────
-    digest_entry = struct.pack('<I', ALG) + lp32(top_digest)
-    digests_seq  = lp32(lp32(digest_entry))
+    signer  = lp32(lp32(signed_data_bytes) + signatures + lp32(pub_der))
+    signers = lp32(signer)
 
-    cert_der    = cert.public_bytes(serialization.Encoding.DER)
-    certs_seq   = lp32(lp32(cert_der))
-    attrs_seq   = lp32(b'')  # no additional attributes
-
-    signed_data = lp32(digests_seq + certs_seq + attrs_seq)
-
-    # ── signature over signed_data ────────────────────────────────
-    raw_sig  = private_key.sign(signed_data, padding.PKCS1v15(), hashes.SHA256())
-    sig_entry = struct.pack('<I', ALG) + lp32(raw_sig)
-    sigs_seq  = lp32(lp32(sig_entry))
-
-    pub_der = private_key.public_key().public_bytes(
-        serialization.Encoding.DER,
-        serialization.PublicFormat.SubjectPublicKeyInfo
-    )
-
-    # ── signer = signed_data + signatures + public_key ────────────
-    signer        = lp32(signed_data + sigs_seq + lp32(pub_der))
-    v2_block_val  = lp32(signer)   # sequence of signers (just one)
-
-    # ── APK Signing Block ─────────────────────────────────────────
-    # pair: uint64(len(id+value)) + uint32(id) + value
-    pair       = struct.pack('<QI', len(v2_block_val) + 4, 0x7109871a) + v2_block_val
-    block_size = len(pair) + 8 + 16   # pairs + second size field + magic
+    BLOCK_ID = 0x7109871a
+    pair = struct.pack('<QI', len(signers), BLOCK_ID) + signers
+    block_size = len(pair) + 8 + 16
     signing_block = (
-        struct.pack('<Q', block_size) +
-        pair +
-        struct.pack('<Q', block_size) +
-        b'APK Sig Block 42'
+        struct.pack('<Q', block_size) + pair +
+        struct.pack('<Q', block_size) + b'APK Sig Block 42'
     )
 
-    # ── reassemble APK with updated CD offset ─────────────────────
     new_cd_offset = cd_offset + len(signing_block)
-    new_eocd = bytearray(apk_bytes[eocd_off:])
+    new_eocd = bytearray(eocd_orig)
     struct.pack_into('<I', new_eocd, 16, new_cd_offset)
-
     return data_block + signing_block + central_dir + bytes(new_eocd)
 
 
@@ -1375,6 +1357,35 @@ def make_webview_dex(package_name, url):
 #  APK BUILDER
 # ══════════════════════════════════════════════════════════════════════
 
+
+def make_min_resources_arsc():
+    """Minimal valid resources.arsc required by Android PackageParser."""
+    def empty_strpool():
+        return struct.pack('<HHIIIIII',
+            0x0001, 28, 28, 0, 0, 0, 28, 0)  # RES_STRING_POOL_TYPE, empty
+
+    sp = empty_strpool()
+    pkg_header_size = 288
+    # Two empty string pools (typeStrings + keyStrings)
+    type_sp = empty_strpool()
+    key_sp  = empty_strpool()
+    pkg_size = pkg_header_size + len(type_sp) + len(key_sp)
+
+    # ResTable_package header: type(H) hdrSize(H) size(I) id(I) name[128](256 bytes) typeStrings(I) lastPubType(I) keyStrings(I) lastPubKey(I) typeIdOffset(I)
+    pkg_hdr = struct.pack('<HHII', 0x0200, pkg_header_size, pkg_size, 0x7f)
+    pkg_hdr += b'\x00' * 256  # name[128] as UTF-16LE, empty
+    pkg_hdr += struct.pack('<IIIII',
+        pkg_header_size,
+        0,
+        pkg_header_size + len(type_sp),
+        0, 0)
+    assert len(pkg_hdr) == pkg_header_size
+
+    pkg_chunk = pkg_hdr + type_sp + key_sp
+    total = 12 + len(sp) + len(pkg_chunk)
+    tbl_hdr = struct.pack('<HHII', 0x0002, 12, total, 1)
+    return tbl_hdr + sp + pkg_chunk
+
 def build_apk(config, out_dir):
     print("\n  🤖 Building Android APK...")
     pkg       = config['package']
@@ -1396,7 +1407,10 @@ def build_apk(config, out_dir):
     manifest_bin = encoder.build(pkg, app_name, version_n, version_c, min_sdk, target_sdk)
     entries.append(('AndroidManifest.xml', manifest_bin))
 
-    # 2. classes.dex — real WebView Activity
+    # 2. resources.arsc (required by Android PackageParser)
+    entries.append(('resources.arsc', make_min_resources_arsc()))
+
+    # 3. classes.dex — real WebView Activity
     dex = make_webview_dex(pkg, url)
     entries.append(('classes.dex', dex))
 
