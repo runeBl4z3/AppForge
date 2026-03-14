@@ -1,0 +1,42 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.appforge.template'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.appforge.template"
+        minSdk 21
+        targetSdk 34
+        versionCode 1
+        versionName "VERSION_PLACEHOLDER"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig null
+        }
+        debug {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    packagingOptions {
+        exclude 'META-INF/DEPENDENCIES'
+        exclude 'META-INF/LICENSE'
+        exclude 'META-INF/NOTICE'
+    }
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'androidx.webkit:webkit:1.9.0'
+}

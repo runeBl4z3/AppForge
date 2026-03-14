@@ -1,0 +1,121 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: 'App name'
+        required: true
+        default: 'My App'
+      package_name:
+        description: 'Package name'
+        required: true
+        default: 'com.example.myapp'
+      website_url:
+        description: 'Website URL'
+        required: true
+        default: 'https://example.com'
+      version_name:
+        description: 'Version'
+        required: false
+        default: '1.0.0'
+      job_id:
+        description: 'Job ID'
+        required: false
+        default: 'manual'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v3
+      with:
+        cmdline-tools-version: 11076708
+        accept-android-sdk-licenses: true
+
+    - name: Install Android build tools
+      run: |
+        sdkmanager "build-tools;34.0.0" "platforms;android-34" --sdk_root=$ANDROID_HOME
+
+    - name: Prepare project
+      run: |
+        APP="${{ github.event.inputs.app_name }}"
+        PKG="${{ github.event.inputs.package_name }}"
+        URL="${{ github.event.inputs.website_url }}"
+        VER="${{ github.event.inputs.version_name }}"
+
+        cp -r android-template/ build-project/
+
+        # Replace placeholders in all text files
+        find build-project/ -type f \( -name "*.java" -o -name "*.xml" -o -name "*.gradle" -o -name "*.properties" \) | while read f; do
+          sed -i "s|APP_NAME_PLACEHOLDER|${APP}|g" "$f"
+          sed -i "s|com\.appforge\.template|${PKG}|g" "$f"
+          sed -i "s|https://placeholder\.appforge\.url|${URL}|g" "$f"
+          sed -i "s|VERSION_PLACEHOLDER|${VER}|g" "$f"
+        done
+
+        # Move Java file to correct package path
+        PKG_PATH=$(echo "$PKG" | tr '.' '/')
+        mkdir -p "build-project/app/src/main/java/${PKG_PATH}"
+        mv build-project/app/src/main/java/PACKAGE_PLACEHOLDER/MainActivity.java \
+           "build-project/app/src/main/java/${PKG_PATH}/MainActivity.java"
+        sed -i "s|package com\.appforge\.template|package ${PKG}|g" \
+           "build-project/app/src/main/java/${PKG_PATH}/MainActivity.java"
+        rm -rf build-project/app/src/main/java/PACKAGE_PLACEHOLDER
+
+        echo "✓ Project prepared: $APP ($PKG) -> $URL"
+        cat build-project/app/src/main/AndroidManifest.xml
+
+    - name: Setup Gradle
+      uses: gradle/actions/setup-gradle@v3
+      with:
+        gradle-version: '8.4'
+
+    - name: Build Release APK
+      working-directory: build-project
+      run: |
+        gradle assembleRelease --no-daemon --stacktrace
+      env:
+        ANDROID_HOME: ${{ env.ANDROID_HOME }}
+
+    - name: Sign APK
+      run: |
+        APK=$(find build-project/app/build/outputs/apk/ -name "*.apk" | head -1)
+        echo "Signing: $APK"
+
+        keytool -genkeypair -v \
+          -keystore appforge.keystore \
+          -alias appforge \
+          -keyalg RSA -keysize 2048 -validity 9999 \
+          -storepass appforge123 -keypass appforge123 \
+          -dname "CN=AppForge,O=AppForge,C=US" 2>/dev/null
+
+        APKSIGNER="$ANDROID_HOME/build-tools/34.0.0/apksigner"
+        $APKSIGNER sign \
+          --ks appforge.keystore \
+          --ks-key-alias appforge \
+          --ks-pass pass:appforge123 \
+          --key-pass pass:appforge123 \
+          --out "${{ github.event.inputs.app_name }}.apk" \
+          "$APK"
+
+        $APKSIGNER verify --verbose "${{ github.event.inputs.app_name }}.apk"
+        ls -lh *.apk
+
+    - name: Upload APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: apk-${{ github.event.inputs.job_id }}
+        path: "*.apk"
+        retention-days: 1

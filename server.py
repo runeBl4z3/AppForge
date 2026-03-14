@@ -1,295 +1,186 @@
 """
-AppForge Flask Backend
-======================
-Connects the website frontend to build.py.
-Handles build requests, runs the builder, and serves download links.
-
-Run locally:   python server.py
-Deploy:        Railway / Render / Heroku (see README)
+AppForge Backend — GitHub Actions Build Engine
 """
-
-import os
-import sys
-import uuid
-import json
-import shutil
-import threading
-import time
+import os, sys, uuid, json, time, threading, shutil, zipfile, requests
 from pathlib import Path
-from flask import Flask, request, jsonify, send_file, render_template_string, send_from_directory
-
-# ── import our builder ──────────────────────────────────────────────
-sys.path.insert(0, os.path.dirname(__file__))
-import build as builder
+from flask import Flask, request, jsonify, send_file
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max
 
-# ── directories ─────────────────────────────────────────────────────
-BASE_DIR   = Path(__file__).parent
-BUILDS_DIR = BASE_DIR / 'builds'
+GITHUB_TOKEN  = os.environ.get('GITHUB_TOKEN', '')
+GITHUB_OWNER  = os.environ.get('GITHUB_OWNER', 'runeBl4z3')
+GITHUB_REPO   = os.environ.get('GITHUB_REPO',  'AppForge')
+WORKFLOW_FILE = 'build-apk.yml'
+BASE_DIR      = Path(__file__).parent
+BUILDS_DIR    = BASE_DIR / 'builds'
 BUILDS_DIR.mkdir(exist_ok=True)
+GH_API        = 'https://api.github.com'
+jobs          = {}
 
-# ── in-memory job tracker ────────────────────────────────────────────
-jobs = {}   # job_id -> { status, progress, message, files, error }
+def gh_headers():
+    return {'Authorization': f'token {GITHUB_TOKEN}',
+            'Accept': 'application/vnd.github.v3+json',
+            'X-GitHub-Api-Version': '2022-11-28'}
 
-# ── auto-cleanup: delete builds older than 1 hour ───────────────────
-def cleanup_old_builds():
-    while True:
-        time.sleep(300)  # check every 5 minutes
-        now = time.time()
-        for job_dir in BUILDS_DIR.iterdir():
-            if job_dir.is_dir():
-                age = now - job_dir.stat().st_mtime
-                if age > 3600:  # 1 hour
-                    shutil.rmtree(job_dir, ignore_errors=True)
-                    job_id = job_dir.name
-                    jobs.pop(job_id, None)
+def trigger_workflow(job_id, app_name, package_name, website_url, version_name='1.0.0'):
+    url = f'{GH_API}/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/workflows/{WORKFLOW_FILE}/dispatches'
+    r = requests.post(url, headers=gh_headers(), json={
+        'ref': 'main',
+        'inputs': {'app_name': app_name, 'package_name': package_name,
+                   'website_url': website_url, 'version_name': version_name,
+                   'job_id': job_id}
+    }, timeout=30)
+    return r.status_code == 204
 
-threading.Thread(target=cleanup_old_builds, daemon=True).start()
+def find_workflow_run(before_time, max_wait=60):
+    url = f'{GH_API}/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/runs'
+    for _ in range(max_wait):
+        time.sleep(3)
+        r = requests.get(url, headers=gh_headers(),
+                         params={'workflow_id': WORKFLOW_FILE, 'per_page': 5}, timeout=30)
+        if r.status_code != 200:
+            continue
+        for run in r.json().get('workflow_runs', []):
+            if run.get('created_at', '') >= before_time:
+                return run['id']
+    return None
 
+def wait_for_run(run_id, job_id, max_minutes=12):
+    url = f'{GH_API}/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/runs/{run_id}'
+    deadline = time.time() + max_minutes * 60
+    while time.time() < deadline:
+        time.sleep(10)
+        r = requests.get(url, headers=gh_headers(), timeout=30)
+        if r.status_code != 200:
+            continue
+        run = r.json()
+        status = run.get('status', '')
+        conclusion = run.get('conclusion')
+        pct = {'queued': 20, 'in_progress': 55, 'completed': 92}.get(status, 30)
+        jobs[job_id].update({'progress': pct, 'message': f'GitHub Actions: {status}...'})
+        if status == 'completed':
+            return conclusion == 'success', conclusion
+    return False, 'timeout'
 
-# ════════════════════════════════════════════════════════════════════
-#  ROUTES
-# ════════════════════════════════════════════════════════════════════
+def download_artifact(run_id, job_id, out_dir):
+    url = f'{GH_API}/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/runs/{run_id}/artifacts'
+    r = requests.get(url, headers=gh_headers(), timeout=30)
+    if r.status_code != 200:
+        return None
+    for artifact in r.json().get('artifacts', []):
+        if artifact['name'].startswith('apk-'):
+            r2 = requests.get(artifact['archive_download_url'], headers=gh_headers(),
+                              stream=True, timeout=120)
+            if r2.status_code == 200:
+                zp = out_dir / 'artifact.zip'
+                with open(zp, 'wb') as f:
+                    for chunk in r2.iter_content(8192):
+                        f.write(chunk)
+                with zipfile.ZipFile(zp) as zf:
+                    zf.extractall(out_dir)
+                zp.unlink()
+                apks = list(out_dir.glob('*.apk'))
+                return apks[0] if apks else None
+    return None
+
+def run_build(job_id, config):
+    try:
+        out_dir = BUILDS_DIR / job_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        jobs[job_id].update({'status': 'running', 'progress': 5, 'message': 'Triggering GitHub Actions build...'})
+
+        if not GITHUB_TOKEN:
+            raise RuntimeError('GITHUB_TOKEN not set. Add it in Railway → Variables.')
+
+        import datetime
+        before = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+
+        if not trigger_workflow(job_id, config['name'], config['package'], config['url'], config.get('version_name','1.0.0')):
+            raise RuntimeError('Failed to trigger GitHub Actions. Check GITHUB_TOKEN has actions:write + repo scope.')
+
+        jobs[job_id].update({'progress': 10, 'message': 'Queued on GitHub Actions, waiting to start...'})
+
+        run_id = find_workflow_run(before)
+        if not run_id:
+            raise RuntimeError('Could not find GitHub Actions run — workflow may have failed to start.')
+
+        jobs[job_id].update({'progress': 18, 'message': f'Run #{run_id} building with real Android SDK...'})
+
+        success, conclusion = wait_for_run(run_id, job_id)
+        if not success:
+            raise RuntimeError(f'Build {conclusion}. See https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/actions')
+
+        jobs[job_id].update({'progress': 93, 'message': 'Build done! Downloading APK...'})
+
+        apk_path = download_artifact(run_id, job_id, out_dir)
+        if not apk_path:
+            raise RuntimeError('Could not download APK artifact from GitHub Actions.')
+
+        final_apk = out_dir / f"{config['name'].replace(' ','_')}.apk"
+        apk_path.rename(final_apk)
+        kb = final_apk.stat().st_size // 1024
+
+        jobs[job_id].update({
+            'status': 'done', 'progress': 100,
+            'message': f'APK ready! ({kb} KB) — built with real Android SDK',
+            'files': [{'name': final_apk.name, 'label': f'Android APK ({kb} KB)',
+                       'platform': 'android', 'url': f'/api/download/{job_id}/{final_apk.name}',
+                       'icon': '🤖'}]
+        })
+    except Exception as e:
+        jobs[job_id].update({'status': 'error', 'progress': 0, 'message': str(e), 'error': str(e)})
 
 @app.route('/')
 def index():
-    """Serve the main website."""
-    html_path = BASE_DIR / 'appbuilder.html'
-    if html_path.exists():
-        return html_path.read_text(encoding='utf-8')
-    return '<h1>AppForge</h1><p>Place appbuilder.html next to server.py</p>', 200
-
+    p = BASE_DIR / 'appbuilder.html'
+    return p.read_text() if p.exists() else '<h1>AppForge</h1>'
 
 @app.route('/api/build', methods=['POST'])
-def start_build():
-    """
-    Start a new app build job.
-    
-    POST body (JSON):
-        url          required   Website URL to wrap
-        name         required   App name
-        package      optional   Bundle ID (auto-generated if blank)
-        version      optional   Version name  (default: 1.0.0)
-        vcode        optional   Version code  (default: 1)
-        minsdk       optional   Android min SDK (default: 21)
-        targetsdk    optional   Android target SDK (default: 34)
-        platforms    optional   Comma-separated: android,windows,ios,linux,all (default: all)
-    
-    Returns:
-        { job_id, status }
-    """
-    data = request.get_json(force=True, silent=True) or {}
-
-    # ── validate ────────────────────────────────────────────────────
+def api_build():
+    data = request.get_json(force=True) or {}
     url  = (data.get('url') or '').strip()
-    name = (data.get('name') or '').strip()
-
-    if not url:
-        return jsonify({'error': 'url is required'}), 400
-    if not name:
-        return jsonify({'error': 'name is required'}), 400
-    if not url.startswith('http'):
-        url = 'https://' + url
-
-    # ── auto package name ────────────────────────────────────────────
-    import re
-    package = (data.get('package') or '').strip()
-    if not package:
+    name = (data.get('name') or 'My App').strip()
+    pkg  = (data.get('package') or '').strip()
+    if not url or not url.startswith('http'):
+        return jsonify({'error': 'Invalid URL'}), 400
+    if not pkg:
+        import re
         host = url.replace('https://','').replace('http://','').replace('www.','').split('/')[0]
-        safe_host = re.sub(r'[^a-z0-9]', '', host.lower().split('.')[0]) or 'app'
-        safe_name = re.sub(r'[^a-z0-9]', '', name.lower().replace(' ','')) or 'myapp'
-        package = f'com.{safe_host}.{safe_name}'
-
-    platforms_raw = data.get('platforms', 'all')
-    platforms = [p.strip().lower() for p in platforms_raw.split(',')]
-    if 'all' in platforms:
-        platforms = ['android', 'windows', 'ios', 'linux']
-
-    config = {
-        'url':          url,
-        'name':         name,
-        'package':      package,
-        'version_name': data.get('version', '1.0.0'),
-        'version_code': int(data.get('vcode', 1)),
-        'min_sdk':      int(data.get('minsdk', 21)),
-        'target_sdk':   int(data.get('targetsdk', 34)),
-    }
-
-    # ── create job ──────────────────────────────────────────────────
-    job_id  = str(uuid.uuid4())
-    out_dir = BUILDS_DIR / job_id
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    jobs[job_id] = {
-        'status':   'queued',
-        'progress': 0,
-        'message':  'Build queued...',
-        'files':    [],
-        'error':    None,
-        'config':   config,
-    }
-
-    # ── run build in background thread ──────────────────────────────
-    t = threading.Thread(
-        target=run_build,
-        args=(job_id, config, platforms, out_dir),
-        daemon=True
-    )
-    t.start()
-
-    return jsonify({'job_id': job_id, 'status': 'queued'}), 202
-
-
-def run_build(job_id, config, platforms, out_dir):
-    """Background worker: runs the builder and updates job status."""
-    job = jobs[job_id]
-
-    try:
-        built_files = []
-        total = len(platforms) + 1  # +1 for master zip
-        step  = 0
-
-        def update(msg, pct=None):
-            job['message']  = msg
-            job['progress'] = pct if pct is not None else job['progress']
-
-        job['status'] = 'building'
-        update('Starting build...', 5)
-
-        if 'android' in platforms:
-            update('Building Android APK...', 15)
-            apk, proj = builder.build_apk(config, out_dir)
-            built_files.append(('Android APK',              apk))
-            built_files.append(('Android Studio Project',   proj))
-            step += 1
-            update('Android ✓', 15 + step * 18)
-
-        if 'windows' in platforms:
-            update('Building Windows package...', 15 + step * 18)
-            win = builder.build_windows(config, out_dir)
-            built_files.append(('Windows Electron Project', win))
-            step += 1
-            update('Windows ✓', 15 + step * 18)
-
-        if 'ios' in platforms:
-            update('Building iOS package...', 15 + step * 18)
-            ios = builder.build_ios(config, out_dir)
-            built_files.append(('iOS Xcode Project',        ios))
-            step += 1
-            update('iOS ✓', 15 + step * 18)
-
-        if 'linux' in platforms:
-            update('Building Linux package...', 15 + step * 18)
-            lnx = builder.build_linux(config, out_dir)
-            built_files.append(('Linux Project',            lnx))
-            step += 1
-            update('Linux ✓', 15 + step * 18)
-
-        update('Bundling all platforms...', 90)
-        master = builder.build_master_zip(config, out_dir, built_files)
-        built_files.append(('All Platforms ZIP', master))
-
-        # Build file list for frontend
-        file_list = []
-        for label, path in built_files:
-            if path and path.exists():
-                file_list.append({
-                    'label':    label,
-                    'filename': path.name,
-                    'size_kb':  round(path.stat().st_size / 1024, 1),
-                    'url':      f'/api/download/{job_id}/{path.name}',
-                })
-
-        job['status']   = 'done'
-        job['progress'] = 100
-        job['message']  = 'Build complete!'
-        job['files']    = file_list
-
-    except Exception as e:
-        import traceback
-        job['status']  = 'error'
-        job['error']   = str(e)
-        job['message'] = f'Build failed: {e}'
-        traceback.print_exc()
-
+        safe = re.sub(r'[^a-z0-9]', '', host.lower().split('.')[0])
+        sname = re.sub(r'[^a-z0-9]', '', name.lower().replace(' ',''))
+        pkg = f'com.{safe or "app"}.{sname or "app"}'
+    job_id = str(uuid.uuid4())[:12]
+    config = {'url': url, 'name': name, 'package': pkg, 'version_name': data.get('version','1.0.0')}
+    jobs[job_id] = {'status':'pending','progress':0,'message':'Starting...','files':[],'error':None,'created':time.time()}
+    threading.Thread(target=run_build, args=(job_id, config), daemon=True).start()
+    return jsonify({'job_id': job_id})
 
 @app.route('/api/status/<job_id>')
-def job_status(job_id):
-    """Poll this endpoint to track build progress."""
+def api_status(job_id):
     job = jobs.get(job_id)
-    if not job:
-        return jsonify({'error': 'Job not found'}), 404
-    return jsonify({
-        'job_id':   job_id,
-        'status':   job['status'],
-        'progress': job['progress'],
-        'message':  job['message'],
-        'files':    job['files'],
-        'error':    job['error'],
-    })
-
+    if not job: return jsonify({'error': 'Not found'}), 404
+    return jsonify({'status':job['status'],'progress':job['progress'],'message':job['message'],'files':job.get('files',[]),'error':job.get('error')})
 
 @app.route('/api/download/<job_id>/<filename>')
-def download_file(job_id, filename):
-    """Download a built file."""
-    # Security: only allow alphanumeric job IDs and safe filenames
-    import re
-    if not re.match(r'^[a-f0-9\-]{36}$', job_id):
-        return jsonify({'error': 'Invalid job ID'}), 400
-    if not re.match(r'^[\w\-. ]+$', filename):
-        return jsonify({'error': 'Invalid filename'}), 400
-
-    file_path = BUILDS_DIR / job_id / filename
-    if not file_path.exists():
-        return jsonify({'error': 'File not found'}), 404
-
-    return send_file(
-        file_path,
-        as_attachment=True,
-        download_name=filename
-    )
-
-
-@app.route('/api/jobs')
-def list_jobs():
-    """List all active jobs (for debugging)."""
-    return jsonify({
-        jid: {
-            'status':   j['status'],
-            'progress': j['progress'],
-            'message':  j['message'],
-            'app':      j.get('config', {}).get('name', '?'),
-        }
-        for jid, j in jobs.items()
-    })
-
+def api_download(job_id, filename):
+    p = BUILDS_DIR / job_id / Path(filename).name
+    if not p.exists(): return jsonify({'error': 'Not found'}), 404
+    return send_file(p, as_attachment=True, download_name=p.name, mimetype='application/vnd.android.package-archive')
 
 @app.route('/health')
 def health():
-    """Health check endpoint for Railway/Render."""
-    return jsonify({'status': 'ok', 'service': 'AppForge Builder API'})
+    return jsonify({'status':'ok','token_set':bool(GITHUB_TOKEN),'repo':f'{GITHUB_OWNER}/{GITHUB_REPO}'})
 
-
-# ════════════════════════════════════════════════════════════════════
-#  START
-# ════════════════════════════════════════════════════════════════════
+def _cleanup():
+    while True:
+        time.sleep(300)
+        cutoff = time.time() - 3600
+        for d in BUILDS_DIR.iterdir():
+            if d.is_dir() and d.stat().st_mtime < cutoff:
+                shutil.rmtree(d, ignore_errors=True)
+threading.Thread(target=_cleanup, daemon=True).start()
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    debug = os.environ.get('DEBUG', 'false').lower() == 'true'
-    print(f'''
-╔══════════════════════════════════════════════════╗
-║        AppForge Backend Server                   ║
-╠══════════════════════════════════════════════════╣
-║  Local:   http://localhost:{port:<22}║
-║  Health:  http://localhost:{port}/health         ║
-║                                                  ║
-║  Endpoints:                                      ║
-║    POST /api/build       Start a build           ║
-║    GET  /api/status/:id  Check build progress    ║
-║    GET  /api/download/:id/:file  Download file   ║
-╚══════════════════════════════════════════════════╝
-''')
-    app.run(host='0.0.0.0', port=port, debug=debug, threaded=True)
+    port = int(os.environ.get('PORT', 8080))
+    print(f'AppForge server — {GITHUB_OWNER}/{GITHUB_REPO} — token: {bool(GITHUB_TOKEN)}')
+    app.run(host='0.0.0.0', port=port, debug=False)
