@@ -102,7 +102,14 @@ jobs:
 
     - name: Sign APK
       run: |
-        APK=$(find build-project/app/build/outputs/apk/ -name "*.apk" | head -1)
+        echo "Searching for APK..."
+        find build-project/app/build/outputs/ -type f 2>/dev/null || echo "outputs dir missing"
+        APK=$(find build-project/app/build/outputs/ -name "*.apk" 2>/dev/null | head -1)
+        if [ -z "$APK" ]; then
+          echo "ERROR: No APK found. Build output:"
+          ls -la build-project/app/build/ 2>/dev/null || echo "build dir missing"
+          exit 1
+        fi
         echo "Found APK: $APK"
         ls -lh "$APK"
 
