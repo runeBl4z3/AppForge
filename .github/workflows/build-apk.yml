@@ -26,29 +26,37 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v3
 
     - name: Set up JDK 17
-      uses: actions/setup-java@v4
+      uses: actions/setup-java@v3
       with:
         java-version: '17'
         distribution: 'temurin'
 
-    - name: Setup Android SDK
-      uses: android-actions/setup-android@v3
-      with:
-        cmdline-tools-version: 11076708
-        accept-android-sdk-licenses: true
-
-    - name: Install Android build tools
+    - name: Install Android SDK components
       run: |
-        sdkmanager "build-tools;34.0.0" "platforms;android-34" --sdk_root=$ANDROID_HOME
+        # Install command line tools
+        sudo apt-get install -y wget unzip
+        mkdir -p $HOME/android-sdk/cmdline-tools
+        wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O cmdtools.zip
+        unzip -q cmdtools.zip -d $HOME/android-sdk/cmdline-tools
+        mv $HOME/android-sdk/cmdline-tools/cmdline-tools $HOME/android-sdk/cmdline-tools/latest
+        export ANDROID_HOME=$HOME/android-sdk
+        export PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools
+        echo "ANDROID_HOME=$HOME/android-sdk" >> $GITHUB_ENV
+        echo "$HOME/android-sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
+        echo "$HOME/android-sdk/platform-tools" >> $GITHUB_PATH
+        echo "$HOME/android-sdk/build-tools/34.0.0" >> $GITHUB_PATH
+        # Accept licenses and install required SDK
+        yes | sdkmanager --licenses > /dev/null 2>&1
+        sdkmanager "platforms;android-34" "build-tools;34.0.0"
 
-    - name: Prepare project
+    - name: Prepare Android project
       run: |
         APP="${{ github.event.inputs.app_name }}"
         PKG="${{ github.event.inputs.package_name }}"
@@ -57,7 +65,7 @@ jobs:
 
         cp -r android-template/ build-project/
 
-        # Replace placeholders in all text files
+        # Replace placeholders
         find build-project/ -type f \( -name "*.java" -o -name "*.xml" -o -name "*.gradle" -o -name "*.properties" \) | while read f; do
           sed -i "s|APP_NAME_PLACEHOLDER|${APP}|g" "$f"
           sed -i "s|com\.appforge\.template|${PKG}|g" "$f"
@@ -65,35 +73,40 @@ jobs:
           sed -i "s|VERSION_PLACEHOLDER|${VER}|g" "$f"
         done
 
-        # Move Java file to correct package path
+        # Move Java to correct package path
         PKG_PATH=$(echo "$PKG" | tr '.' '/')
         mkdir -p "build-project/app/src/main/java/${PKG_PATH}"
-        mv build-project/app/src/main/java/PACKAGE_PLACEHOLDER/MainActivity.java \
+        mv "build-project/app/src/main/java/PACKAGE_PLACEHOLDER/MainActivity.java" \
            "build-project/app/src/main/java/${PKG_PATH}/MainActivity.java"
         sed -i "s|package com\.appforge\.template|package ${PKG}|g" \
            "build-project/app/src/main/java/${PKG_PATH}/MainActivity.java"
         rm -rf build-project/app/src/main/java/PACKAGE_PLACEHOLDER
 
-        echo "✓ Project prepared: $APP ($PKG) -> $URL"
-        cat build-project/app/src/main/AndroidManifest.xml
+        # Add local.properties for Android SDK path
+        echo "sdk.dir=$ANDROID_HOME" > build-project/local.properties
 
-    - name: Setup Gradle
-      uses: gradle/actions/setup-gradle@v3
-      with:
-        gradle-version: '8.4'
+        echo "✓ Project prepared: $APP ($PKG) -> $URL"
+
+    - name: Install Gradle
+      run: |
+        wget -q https://services.gradle.org/distributions/gradle-8.4-bin.zip -O gradle.zip
+        unzip -q gradle.zip -d $HOME/gradle-dist
+        echo "$HOME/gradle-dist/gradle-8.4/bin" >> $GITHUB_PATH
 
     - name: Build Release APK
       working-directory: build-project
       run: |
-        gradle assembleRelease --no-daemon --stacktrace
+        gradle assembleRelease --no-daemon --no-build-cache --info 2>&1 | tail -50
       env:
         ANDROID_HOME: ${{ env.ANDROID_HOME }}
 
     - name: Sign APK
       run: |
         APK=$(find build-project/app/build/outputs/apk/ -name "*.apk" | head -1)
-        echo "Signing: $APK"
+        echo "Found APK: $APK"
+        ls -lh "$APK"
 
+        # Generate keystore
         keytool -genkeypair -v \
           -keystore appforge.keystore \
           -alias appforge \
@@ -101,20 +114,23 @@ jobs:
           -storepass appforge123 -keypass appforge123 \
           -dname "CN=AppForge,O=AppForge,C=US" 2>/dev/null
 
-        APKSIGNER="$ANDROID_HOME/build-tools/34.0.0/apksigner"
-        $APKSIGNER sign \
+        SAFE_NAME=$(echo "${{ github.event.inputs.app_name }}" | tr ' ' '_')
+
+        # Sign with apksigner
+        $ANDROID_HOME/build-tools/34.0.0/apksigner sign \
           --ks appforge.keystore \
           --ks-key-alias appforge \
           --ks-pass pass:appforge123 \
           --key-pass pass:appforge123 \
-          --out "${{ github.event.inputs.app_name }}.apk" \
+          --out "${SAFE_NAME}.apk" \
           "$APK"
 
-        $APKSIGNER verify --verbose "${{ github.event.inputs.app_name }}.apk"
+        # Verify
+        $ANDROID_HOME/build-tools/34.0.0/apksigner verify --verbose "${SAFE_NAME}.apk"
         ls -lh *.apk
 
     - name: Upload APK
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v3
       with:
         name: apk-${{ github.event.inputs.job_id }}
         path: "*.apk"
