@@ -96,22 +96,25 @@ jobs:
     - name: Build Release APK
       working-directory: build-project
       run: |
-        gradle assembleRelease --no-daemon --no-build-cache --info 2>&1 | tail -50
+        set -e
+        gradle assembleDebug --no-daemon --no-build-cache --stacktrace 2>&1
+        echo "=== Gradle finished, checking output ===" 
+        echo "--- Build output files ---"
+        find app/build/ -type f -name "*.apk" 2>/dev/null && echo "APKs found above" || echo "No APKs yet"
       env:
         ANDROID_HOME: ${{ env.ANDROID_HOME }}
 
     - name: Sign APK
       run: |
-        echo "Searching for APK..."
-        find build-project/app/build/outputs/ -type f 2>/dev/null || echo "outputs dir missing"
-        APK=$(find build-project/app/build/outputs/ -name "*.apk" 2>/dev/null | head -1)
+        echo "=== Searching for APK ==="
+        find build-project/app/build/ -type f -name "*.apk" 2>/dev/null || echo "No APKs found anywhere"
+        APK=$(find build-project/app/build/ -type f -name "*.apk" 2>/dev/null | head -1)
         if [ -z "$APK" ]; then
-          echo "ERROR: No APK found. Build output:"
-          ls -la build-project/app/build/ 2>/dev/null || echo "build dir missing"
+          echo "ERROR: No APK produced. Full build directory:"
+          find build-project/app/build/ -type f 2>/dev/null | head -30
           exit 1
         fi
-        echo "Found APK: $APK"
-        ls -lh "$APK"
+        echo "Found APK: $APK ($(du -h "$APK" | cut -f1))"
 
         # Generate keystore
         keytool -genkeypair -v \
