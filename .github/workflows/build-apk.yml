@@ -32,7 +32,7 @@ jobs:
   # ── ANDROID ────────────────────────────────────────────────────────
   build-android:
     runs-on: ubuntu-22.04
-    if: contains(github.event.inputs.platforms, 'android')
+    if: github.event.inputs.platforms == '' || contains(github.event.inputs.platforms, 'android')
 
     steps:
     - uses: actions/checkout@v4
@@ -113,7 +113,7 @@ jobs:
   # ── WINDOWS ────────────────────────────────────────────────────────
   build-windows:
     runs-on: windows-latest
-    if: contains(github.event.inputs.platforms, 'windows')
+    if: github.event.inputs.platforms == '' || contains(github.event.inputs.platforms, 'windows')
 
     steps:
     - uses: actions/checkout@v4
@@ -214,7 +214,7 @@ jobs:
   # ── LINUX ──────────────────────────────────────────────────────────
   build-linux:
     runs-on: ubuntu-22.04
-    if: contains(github.event.inputs.platforms, 'linux')
+    if: github.event.inputs.platforms == '' || contains(github.event.inputs.platforms, 'linux')
 
     steps:
     - uses: actions/checkout@v4
