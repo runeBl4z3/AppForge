@@ -36,7 +36,9 @@ def trigger_workflow(job_id, config, platforms='android,windows,linux'):
             'platforms':   platforms,
         }
     }, timeout=30)
-    return r.status_code == 204
+    if r.status_code != 204:
+        raise RuntimeError(f'GitHub API {r.status_code}: {r.text[:300]}')
+    return True
 
 def find_workflow_run(before_time, max_wait=60):
     url = f'{GH_API}/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/runs'
@@ -139,8 +141,7 @@ def run_build(job_id, config, platforms):
         import datetime
         before = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
 
-        if not trigger_workflow(job_id, config, platforms):
-            raise RuntimeError('Failed to trigger GitHub Actions workflow. Check GITHUB_TOKEN permissions.')
+        trigger_workflow(job_id, config, platforms)
 
         jobs[job_id].update({'progress': 10, 'message': 'Queued — waiting for runners to start...'})
 
@@ -222,6 +223,26 @@ def api_download(job_id, filename):
 def health():
     return jsonify({'status':'ok','token_set':bool(GITHUB_TOKEN),
                     'repo':f'{GITHUB_OWNER}/{GITHUB_REPO}'})
+
+@app.route('/debug')
+def debug():
+    """Check GitHub token permissions and workflow existence."""
+    results = {}
+    # Check token works
+    r = requests.get(f'{GH_API}/user', headers=gh_headers(), timeout=10)
+    results['token_valid'] = r.status_code == 200
+    results['token_user']  = r.json().get('login') if r.status_code == 200 else r.text[:100]
+    # Check repo accessible
+    r2 = requests.get(f'{GH_API}/repos/{GITHUB_OWNER}/{GITHUB_REPO}', headers=gh_headers(), timeout=10)
+    results['repo_accessible'] = r2.status_code == 200
+    # Check workflow exists
+    r3 = requests.get(f'{GH_API}/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/workflows/{WORKFLOW_FILE}',
+                      headers=gh_headers(), timeout=10)
+    results['workflow_found'] = r3.status_code == 200
+    results['workflow_state'] = r3.json().get('state') if r3.status_code == 200 else r3.text[:100]
+    # Check token scopes
+    results['token_scopes'] = r.headers.get('X-OAuth-Scopes', 'unknown')
+    return jsonify(results)
 
 def _cleanup():
     while True:
