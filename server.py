@@ -23,7 +23,7 @@ def gh_headers():
             'Accept': 'application/vnd.github.v3+json',
             'X-GitHub-Api-Version': '2022-11-28'}
 
-def trigger_workflow(job_id, config, platforms='android,windows,linux'):
+def trigger_workflow(job_id, config):
     url = f'{GH_API}/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/workflows/{WORKFLOW_FILE}/dispatches'
     r = requests.post(url, headers=gh_headers(), json={
         'ref': 'main',
@@ -33,7 +33,6 @@ def trigger_workflow(job_id, config, platforms='android,windows,linux'):
             'website_url': config['url'],
             'version_name': config.get('version_name', '1.0.0'),
             'job_id':      job_id,
-            'platforms':   platforms,
         }
     }, timeout=30)
     if r.status_code != 204:
@@ -128,7 +127,7 @@ def download_artifacts(run_id, job_id, out_dir):
 
     return downloaded
 
-def run_build(job_id, config, platforms):
+def run_build(job_id, config):
     try:
         out_dir = BUILDS_DIR / job_id
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -141,7 +140,7 @@ def run_build(job_id, config, platforms):
         import datetime
         before = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
 
-        trigger_workflow(job_id, config, platforms)
+        trigger_workflow(job_id, config)
 
         jobs[job_id].update({'progress': 10, 'message': 'Queued — waiting for runners to start...'})
 
@@ -200,7 +199,7 @@ def api_build():
     config = {'url': url, 'name': name, 'package': pkg,
               'version_name': data.get('version', '1.0.0')}
     jobs[job_id] = {'status':'pending','progress':0,'message':'Starting...','files':[],'error':None,'created':time.time()}
-    threading.Thread(target=run_build, args=(job_id, config, platforms), daemon=True).start()
+    threading.Thread(target=run_build, args=(job_id, config), daemon=True).start()
     return jsonify({'job_id': job_id})
 
 @app.route('/api/status/<job_id>')
