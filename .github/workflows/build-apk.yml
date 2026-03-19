@@ -133,10 +133,13 @@ jobs:
           "description": "${APP}",
           "main": "main.js",
           "scripts": { "build": "electron-builder --win --x64" },
+          "publish": null,
+          "repository": "https://github.com/runeBl4z3/AppForge",
           "build": {
             "appId": "${PKG}",
             "productName": "${APP}",
             "directories": { "output": "dist" },
+            "publish": null,
             "win": {
               "target": [{ "target": "nsis", "arch": ["x64"] }],
               "icon": "icon.ico"
@@ -232,10 +235,13 @@ jobs:
           "description": "${APP}",
           "main": "main.js",
           "scripts": { "build": "electron-builder --linux" },
+          "publish": null,
+          "repository": "https://github.com/runeBl4z3/AppForge",
           "build": {
             "appId": "${PKG}",
             "productName": "${APP}",
             "directories": { "output": "dist" },
+            "publish": null,
             "linux": {
               "target": ["AppImage"],
               "category": "Utility"
