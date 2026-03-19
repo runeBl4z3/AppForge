@@ -132,7 +132,7 @@ def run_build(job_id, config):
         out_dir = BUILDS_DIR / job_id
         out_dir.mkdir(parents=True, exist_ok=True)
         jobs[job_id].update({'status': 'running', 'progress': 5,
-                             'message': f'Triggering GitHub Actions ({platforms})...'})
+                             'message': f'Triggering GitHub Actions build...'})
 
         if not GITHUB_TOKEN:
             raise RuntimeError('GITHUB_TOKEN not set in Railway environment variables.')
@@ -184,7 +184,6 @@ def api_build():
     url  = (data.get('url') or '').strip()
     name = (data.get('name') or 'My App').strip()
     pkg  = (data.get('package') or '').strip()
-    platforms = (data.get('platforms') or 'android,windows,linux').strip()
 
     if not url or not url.startswith('http'):
         return jsonify({'error': 'Invalid URL'}), 400
