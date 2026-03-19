@@ -142,7 +142,6 @@ jobs:
             "publish": null,
             "win": {
               "target": [{ "target": "nsis", "arch": ["x64"] }],
-              "icon": "icon.ico"
             },
             "nsis": {
               "oneClick": false,
@@ -174,14 +173,6 @@ jobs:
         app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
         MAINJSEOF
 
-        # Create a simple ICO (1x1 pixel placeholder - electron-builder needs one)
-        node -e "
-        const fs = require('fs');
-        // Minimal valid ICO file (16x16 blue square)
-        const ico = Buffer.from('000001000100101000000100200068040000160000002800000010000000200000000100200000000000400400000000000000000000000000000000000000ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff5b6ef5ff000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000', 'hex');
-        fs.writeFileSync('icon.ico', ico);
-        console.log('ICO created');
-        "
 
     - name: Install dependencies
       working-directory: electron-app
