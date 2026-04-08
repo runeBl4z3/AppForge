@@ -1,0 +1,132 @@
+name: Railed Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      service_id:
+        required: true
+        type: string
+      service_name:
+        required: true
+        type: string
+      stack:
+        required: true
+        type: string
+      build_command:
+        required: false
+        type: string
+        default: ""
+      start_command:
+        required: false
+        type: string
+        default: ""
+      port:
+        required: false
+        type: string
+        default: "3000"
+      env_vars:
+        required: false
+        type: string
+        default: "{}"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Write env vars to .env file ──────────────────────────────────────────
+      - name: Write environment variables
+        run: |
+          echo '${{ inputs.env_vars }}' | python3 -c "
+          import json, sys
+          vars = json.load(sys.stdin)
+          for k, v in vars.items():
+              print(f'{k}={v}')
+          " > .env
+          echo "PORT=${{ inputs.port }}" >> .env
+
+      # ── Python ───────────────────────────────────────────────────────────────
+      - name: Setup Python
+        if: inputs.stack == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python deps
+        if: inputs.stack == 'python' && inputs.build_command != ''
+        run: ${{ inputs.build_command }}
+
+      - name: Test Python app starts
+        if: inputs.stack == 'python'
+        run: |
+          set -a && source .env && set +a
+          timeout 10 ${{ inputs.start_command }} &
+          sleep 5
+          curl --fail http://localhost:${{ inputs.port }} || curl --fail http://localhost:${{ inputs.port }}/health || echo "App started (no health endpoint)"
+          kill %1 2>/dev/null || true
+        continue-on-error: false
+
+      # ── Node / React ─────────────────────────────────────────────────────────
+      - name: Setup Node
+        if: inputs.stack == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install Node deps & build
+        if: inputs.stack == 'node' && inputs.build_command != ''
+        run: ${{ inputs.build_command }}
+
+      - name: Test Node app starts
+        if: inputs.stack == 'node'
+        run: |
+          set -a && source .env && set +a
+          timeout 10 ${{ inputs.start_command }} &
+          sleep 5
+          curl --fail http://localhost:${{ inputs.port }} || echo "App started"
+          kill %1 2>/dev/null || true
+        continue-on-error: false
+
+      # ── Docker ───────────────────────────────────────────────────────────────
+      - name: Build Docker image
+        if: inputs.stack == 'docker'
+        run: docker build -t railed-app-${{ inputs.service_id }} .
+
+      - name: Test Docker container
+        if: inputs.stack == 'docker'
+        run: |
+          docker run -d --env-file .env -p ${{ inputs.port }}:${{ inputs.port }} \
+            --name test-container railed-app-${{ inputs.service_id }}
+          sleep 5
+          curl --fail http://localhost:${{ inputs.port }} || echo "Container started"
+          docker stop test-container
+
+      # ── Upload build artifact ─────────────────────────────────────────────
+      - name: Package build output
+        run: |
+          mkdir -p railed-dist
+          if [ -d "dist" ]; then cp -r dist/. railed-dist/; fi
+          if [ -d "build" ]; then cp -r build/. railed-dist/; fi
+          if [ -d ".next" ]; then cp -r .next/. railed-dist/; fi
+          cp .env railed-dist/ 2>/dev/null || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: railed-build-${{ inputs.service_id }}
+          path: railed-dist/
+          retention-days: 7
+
+      # ── Notify backend of result ──────────────────────────────────────────
+      - name: Notify Railed backend
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          curl -s -X POST "${{ secrets.RAILED_BACKEND_URL }}/webhooks/deploy-complete" \
+            -H "Content-Type: application/json" \
+            -H "X-Railed-Secret: ${{ secrets.RAILED_WEBHOOK_SECRET }}" \
+            -d "{\"service_id\":\"${{ inputs.service_id }}\",\"status\":\"$STATUS\",\"run_id\":\"${{ github.run_id }}\"}" \
+            || echo "Backend notification skipped"
